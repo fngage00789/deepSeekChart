@@ -7,363 +7,215 @@ import io
 import os
 import asyncio
 from matplotlib.ticker import MaxNLocator
-from discord.utils import get
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
 from textblob import TextBlob
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask
-from threading import Thread
+import json
+import logging
+import traceback
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log')
+    ]
+)
+logger = logging.getLogger('discord')
 
 # Load environment variables
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 
 if not DISCORD_TOKEN:
-    raise ValueError(
-        "No Discord token found. Please set DISCORD_TOKEN in your .env file")
-
-# Flask server setup for keep_alive
-app = Flask('')
-
-
-@app.route('/')
-def home():
-    return "Discord Bot is Alive!"
-
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-
-# Start the keep_alive server
-keep_alive()
+    logger.critical("No DISCORD_TOKEN found in .env file")
+    raise ValueError("Missing Discord token")
 
 # Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Symbols to track with full names
+bot = commands.Bot(
+    command_prefix='!',
+    intents=intents,
+    help_command=None
+)
+
+# Symbols to track
 symbols = {'NAS100': '^NDX', 'Gold': 'GC=F'}
 
 # Chart colors
 COLORS = {
-    'up': '#4CAF50',  # Green
-    'down': '#F44336',  # Red
-    'volume': '#2196F3',  # Blue
-    'neutral': '#FFC107',  # Yellow
-    'impact_high': '#FF5722',  # Deep Orange
-    'impact_medium': '#FF9800',  # Orange
-    'impact_low': '#FFC107'  # Amber
+    'up': '#4CAF50',
+    'down': '#F44336',
+    'volume': '#2196F3',
+    'neutral': '#FFC107',
+    'impact_high': '#FF5722'
 }
 
-# Server data storage
-server_data = {}
-
-
+# Server data persistence
 class ServerData:
+    def __init__(self, channel_id=None, auto_update=False):
+        self.channel_id = channel_id
+        self.auto_update = auto_update
 
-    def __init__(self):
-        self.channel_id = None
-        self.auto_update = False
+def save_data():
+    """Save server data to JSON file"""
+    with open('server_data.json', 'w') as f:
+        json.dump(
+            {guild_id: vars(data) for guild_id, data in server_data.items()},
+            f
+        )
 
-
-def fetch_market_sentiment():
-    """Fetch market sentiment from Forex Factory news and calendar"""
+def load_data():
+    """Load server data from JSON file"""
     try:
-        url = "https://www.forexfactory.com/"
-        headers = {
-            'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers)
+        with open('server_data.json', 'r') as f:
+            data = json.load(f)
+            return {int(guild_id): ServerData(**values) for guild_id, values in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+server_data = load_data()
+
+# Market data functions
+def fetch_market_sentiment():
+    """Fetch market sentiment from Forex Factory"""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get("https://www.forexfactory.com/", headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
-
+        
         events = []
-        calendar = soup.find('table', class_='calendar__table')
-
-        if calendar:
-            for row in calendar.find_all('tr', class_='calendar__row'):
-                if 'calendar__row--header' in row.get('class', []):
-                    continue
-
-                event = {
-                    'time':
-                    row.find('td',
-                             class_='calendar__time').get_text(strip=True),
-                    'currency':
-                    row.find('td',
-                             class_='calendar__currency').get_text(strip=True),
-                    'impact':
-                    row.find('td', class_='calendar__impact').find(
-                        'span')['title'].lower()
-                    if row.find('td', class_='calendar__impact').find('span')
-                    else 'low',
-                    'event':
-                    row.find('td',
-                             class_='calendar__event').get_text(strip=True),
-                    'actual':
-                    row.find('td',
-                             class_='calendar__actual').get_text(strip=True),
-                    'forecast':
-                    row.find('td',
-                             class_='calendar__forecast').get_text(strip=True),
-                    'previous':
-                    row.find('td',
-                             class_='calendar__previous').get_text(strip=True)
-                }
-
-                if event['impact'] in ['high', 'medium']:
-                    events.append(event)
-
-        sentiment_score = 0
-        for event in events:
-            try:
-                actual = float(event['actual'])
-                forecast = float(event['forecast'])
-                sentiment_score += (
-                    actual - forecast) / forecast if forecast != 0 else 0
-            except (ValueError, TypeError):
+        for row in soup.find_all('tr', class_='calendar__row'):
+            if 'calendar__row--header' in row.get('class', []):
                 continue
-
-        avg_sentiment = np.clip(sentiment_score / len(events) if events else 0,
-                                -1, 1)
-
+                
+            event = {
+                'time': row.find('td', class_='calendar__time').get_text(strip=True),
+                'impact': row.find('td', class_='calendar__impact').find('span')['title'].lower() 
+                         if row.find('td', class_='calendar__impact').find('span') else 'low'
+            }
+            if event['impact'] in ['high', 'medium']:
+                events.append(event)
+                
         return {
-            'events': events[:5],
-            'sentiment': avg_sentiment,
-            'bullish': avg_sentiment > 0.1,
-            'bearish': avg_sentiment < -0.1,
             'impact_events': len([e for e in events if e['impact'] == 'high'])
         }
+        
     except Exception as e:
-        print(f"Error fetching Forex Factory sentiment: {e}")
+        logger.error(f"Error fetching sentiment: {str(e)}")
         return None
 
-
-def create_nas100_chart(symbol_name,
-                        symbol_data,
-                        history,
-                        sentiment_data=None):
-    """Create an advanced NAS100 futures chart with technical indicators and sentiment"""
-    plt.style.use('dark_background')
-    fig, (ax1, ax2,
-          ax3) = plt.subplots(3,
-                              1,
-                              figsize=(12, 10),
-                              gridspec_kw={'height_ratios': [3, 1, 1]},
-                              sharex=True)
-
-    # Calculate technical indicators
-    prices = history['Close']
-    sma20 = prices.rolling(window=20).mean()
-    sma50 = prices.rolling(window=50).mean()
-    rolling_std = prices.rolling(window=20).std()
-    upper_band = sma20 + (2 * rolling_std)
-    lower_band = sma20 - (2 * rolling_std)
-
-    # Price chart
-    ax1.plot(history.index, prices, label='Price', color='white', linewidth=2)
-    ax1.plot(history.index,
-             sma20,
-             label='20-SMA',
-             color='#FF9800',
-             linestyle='--')
-    ax1.plot(history.index,
-             sma50,
-             label='50-SMA',
-             color='#9C27B0',
-             linestyle='--')
-    ax1.fill_between(history.index,
-                     upper_band,
-                     lower_band,
-                     color='#3F51B5',
-                     alpha=0.2)
-
-    if sentiment_data:
-        sentiment_color = COLORS['up'] if sentiment_data['bullish'] else (
-            COLORS['down'] if sentiment_data['bearish'] else COLORS['neutral'])
-        ax1.axhspan(prices.min(),
-                    prices.max(),
-                    facecolor=sentiment_color,
-                    alpha=0.1)
-
-        if sentiment_data.get('impact_events', 0) > 0:
-            ax1.annotate(
-                f"⚠️ {sentiment_data['impact_events']} High Impact Events",
-                xy=(0.02, 0.95),
-                xycoords='axes fraction',
-                color=COLORS['impact_high'],
-                fontsize=10)
-
-    ax1.set_title(f'{symbol_name} Futures - Advanced Analysis', pad=20)
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    # Volume chart
-    ax2.bar(history.index,
-            history['Volume'],
-            color=COLORS['volume'],
-            alpha=0.7)
-    ax2.set_ylabel('Volume')
-    ax2.grid(True, alpha=0.3)
-
-    # RSI indicator
-    delta = prices.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=14).mean()
-    avg_loss = loss.rolling(window=14).mean()
-    rsi = 100 - (100 / (1 + (avg_gain / avg_loss)))
-
-    ax3.plot(history.index, rsi, label='RSI', color='#00BCD4', linewidth=2)
-    ax3.axhline(70, color=COLORS['down'], linestyle='--', alpha=0.7)
-    ax3.axhline(30, color=COLORS['up'], linestyle='--', alpha=0.7)
-    ax3.set_ylabel('RSI')
-    ax3.grid(True, alpha=0.3)
-
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-    buf.seek(0)
-    plt.close()
-    return buf
-
+def create_chart(symbol_name, history, sentiment_data=None):
+    """Generate market chart with technical indicators"""
+    try:
+        plt.style.use('dark_background')
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1, 1]})
+        
+        # Price chart
+        prices = history['Close']
+        sma20 = prices.rolling(20).mean()
+        sma50 = prices.rolling(50).mean()
+        
+        ax1.plot(history.index, prices, label='Price', color='white', linewidth=2)
+        ax1.plot(history.index, sma20, label='20-SMA', color='#FF9800', linestyle='--')
+        ax1.plot(history.index, sma50, label='50-SMA', color='#9C27B0', linestyle='--')
+        
+        # RSI
+        delta = prices.diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        rsi = 100 - (100 / (1 + (gain.rolling(14).mean() / loss.rolling(14).mean())))
+        
+        ax3.plot(history.index, rsi, color='#00BCD4')
+        ax3.axhline(70, color=COLORS['down'], linestyle='--')
+        ax3.axhline(30, color=COLORS['up'], linestyle='--')
+        
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        buf.seek(0)
+        plt.close()
+        return buf
+        
+    except Exception as e:
+        logger.error(f"Chart error: {str(e)}")
+        raise
 
 async def send_market_update(channel, symbol_name, symbol):
-    """Send advanced market data for a specific symbol to a channel"""
+    """Send market update to specified channel"""
     try:
         data = yf.Ticker(symbol)
         hist = data.history(period='2d', interval='15m')
-
+        
         if hist.empty:
+            await channel.send(f"❌ No data for {symbol_name}")
             return False
-
-        sentiment_data = fetch_market_sentiment(
-        ) if symbol_name == 'NAS100' else None
-        chart = create_nas100_chart(symbol_name, symbol, hist, sentiment_data)
-
-        await channel.send(file=discord.File(
-            chart, filename=f"{symbol_name.replace('/', '_')}_chart.png"))
-
-        latest = hist.iloc[-1]
-        prev_close = hist.iloc[-2]['Close'] if len(
-            hist) > 1 else latest['Close']
-        change = latest['Close'] - prev_close
-        pct_change = (change / prev_close) * 100
-
-        # Calculate technical indicators
-        delta = hist['Close'].diff()
-        avg_gain = delta.where(delta > 0, 0).rolling(window=14).mean().iloc[-1]
-        avg_loss = -delta.where(delta < 0,
-                                0).rolling(window=14).mean().iloc[-1]
-        rsi = 100 - (100 / (1 + (avg_gain / avg_loss))) if avg_loss != 0 else 0
-
-        sma20 = hist['Close'].rolling(window=20).mean().iloc[-1]
-        rolling_std = hist['Close'].rolling(window=20).std().iloc[-1]
-        bb_status = "Near Upper Band" if latest['Close'] > sma20 + (
-            1.9 * rolling_std) else (
-                "Near Lower Band" if latest['Close'] < sma20 -
-                (1.9 * rolling_std) else "Mid Range")
-
-        embed = discord.Embed(
-            title=f"{symbol_name} Market Analysis",
-            description=
-            f"Last updated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            color=0x00ff00 if change >= 0 else 0xff0000)
-
-        embed.add_field(name="Price",
-                        value=f"${latest['Close']:.2f}",
-                        inline=True)
-        embed.add_field(name="Change",
-                        value=f"{change:+.2f} ({pct_change:+.2f}%)",
-                        inline=True)
-        embed.add_field(name="RSI (14)", value=f"{rsi:.2f}", inline=True)
-        embed.add_field(name="Bollinger Bands", value=bb_status, inline=True)
-
-        if symbol_name == 'NAS100' and sentiment_data:
-            sentiment_status = "Bullish 🚀" if sentiment_data['bullish'] else (
-                "Bearish 🐻" if sentiment_data['bearish'] else "Neutral ⚖️")
-            embed.add_field(name="Sentiment",
-                            value=sentiment_status,
-                            inline=True)
-            embed.add_field(name="Impact Events",
-                            value=sentiment_data.get('impact_events', 0),
-                            inline=True)
-
-        embed.add_field(
-            name="Range",
-            value=f"${hist['Low'].min():.2f} - ${hist['High'].max():.2f}",
-            inline=True)
-        embed.add_field(name="Volume",
-                        value=f"{latest['Volume']:,.0f}",
-                        inline=True)
-
-        await channel.send(embed=embed)
+            
+        chart = create_chart(symbol_name, hist)
+        await channel.send(
+            file=discord.File(chart, f"{symbol_name}_chart.png"),
+            embed=discord.Embed(
+                title=f"{symbol_name} Market Update",
+                description=f"Last update: {datetime.datetime.now().strftime('%H:%M:%S')}",
+                color=0x00ff00 if hist['Close'][-1] > hist['Close'][-2] else 0xff0000
+            ).add_field(
+                name="Price",
+                value=f"${hist['Close'][-1]:.2f}",
+                inline=True
+            )
+        )
         return True
-
+        
     except Exception as e:
-        print(f"Error fetching {symbol_name}: {e}")
-        await channel.send(f"❌ Could not retrieve data for {symbol_name}")
+        logger.error(f"Market update failed: {str(e)}")
+        await channel.send(f"❌ Error updating {symbol_name}")
         return False
 
-
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user.name}')
-    for guild in bot.guilds:
-        server_data[guild.id] = ServerData()
-    if not auto_update.is_running():
-        auto_update.start()
-
-
+# Bot commands
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setupchannel(ctx, channel: discord.TextChannel = None):
+    """Set the channel for automatic updates"""
     channel = channel or ctx.channel
-    server_data[ctx.guild.id].channel_id = channel.id
-    await ctx.send(f"✅ Market updates will be posted in {channel.mention}")
-
+    server_data[ctx.guild.id] = ServerData(channel.id, False)
+    save_data()
+    await ctx.send(f"✅ Updates will be posted in {channel.mention}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def toggleauto(ctx):
-    server_data[
-        ctx.guild.id].auto_update = not server_data[ctx.guild.id].auto_update
-    status = "ON" if server_data[ctx.guild.id].auto_update else "OFF"
-    await ctx.send(f"✅ Automatic updates are now {status}")
-
+    """Toggle automatic updates"""
+    server = server_data[ctx.guild.id]
+    server.auto_update = not server.auto_update
+    save_data()
+    await ctx.send(f"✅ Automatic updates {'ENABLED' if server.auto_update else 'DISABLED'}")
 
 @bot.command()
 async def market(ctx, symbol_name: str = None):
+    """Manual market update"""
     if symbol_name:
-        symbol_found = next(
-            ((n, s)
-             for n, s in symbols.items() if symbol_name.lower() in n.lower()),
-            None)
-        if symbol_found:
-            await send_market_update(ctx.channel, *symbol_found)
+        symbol = symbols.get(symbol_name.title())
+        if symbol:
+            await send_market_update(ctx.channel, symbol_name, symbol)
         else:
-            await ctx.send(
-                f"❌ Symbol not found. Available: {', '.join(symbols.keys())}")
+            await ctx.send(f"❌ Invalid symbol. Options: {', '.join(symbols.keys())}")
     else:
         for name, symbol in symbols.items():
             await send_market_update(ctx.channel, name, symbol)
 
-
+# Automatic updates
 @tasks.loop(minutes=15)
 async def auto_update():
+    """Automatic market updates every 15 minutes"""
+    logger.info("Running auto-update")
     for guild_id, data in server_data.items():
         if data.auto_update and data.channel_id:
             channel = bot.get_channel(data.channel_id)
@@ -371,8 +223,40 @@ async def auto_update():
                 for name, symbol in symbols.items():
                     await send_market_update(channel, name, symbol)
 
+# Bot events
+@bot.event
+async def on_ready():
+    """Initialize when bot starts"""
+    logger.info(f"Logged in as {bot.user.name}")
+    
+    # Initialize missing guilds
+    for guild in bot.guilds:
+        if guild.id not in server_data:
+            server_data[guild.id] = ServerData()
+    
+    # Start auto-update task
+    if not auto_update.is_running():
+        auto_update.start()
+        logger.info("Auto-update task started")
 
-try:
-    bot.run(DISCORD_TOKEN)
-except Exception as e:
-    print(f"Error starting bot: {e}")
+@bot.event
+async def on_guild_join(guild):
+    """Initialize data for new servers"""
+    server_data[guild.id] = ServerData()
+    save_data()
+
+# Error handling
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You need administrator permissions for this command")
+    else:
+        logger.error(f"Command error: {str(error)}")
+        await ctx.send("❌ An error occurred")
+
+# Run the bot
+if __name__ == "__main__":
+    try:
+        bot.run(DISCORD_TOKEN)
+    except Exception as e:
+        logger.critical(f"Bot crashed: {str(e)}")
