@@ -16,6 +16,15 @@ from bs4 import BeautifulSoup
 import json
 import logging
 import traceback
+from cachetools import TTLCache
+
+# ======================
+# CONFIGURATION
+# ======================
+load_dotenv()
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+if not DISCORD_TOKEN:
+    raise ValueError("Missing Discord token in environment variables")
 
 # Configure logging
 logging.basicConfig(
@@ -28,14 +37,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger('discord')
 
-# Load environment variables
-load_dotenv()
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-
-if not DISCORD_TOKEN:
-    logger.critical("No DISCORD_TOKEN found in .env file")
-    raise ValueError("Missing Discord token")
-
 # Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
@@ -47,10 +48,11 @@ bot = commands.Bot(
     help_command=None
 )
 
-# Symbols to track
+# Market symbols and cache
 symbols = {'NAS100': '^NDX', 'Gold': 'GC=F'}
+data_cache = TTLCache(maxsize=100, ttl=1800)  # 30 minute cache
 
-# Chart colors
+# Chart styling
 COLORS = {
     'up': '#4CAF50',
     'down': '#F44336',
@@ -59,7 +61,9 @@ COLORS = {
     'impact_high': '#FF5722'
 }
 
-# Server data persistence
+# ======================
+# DATA PERSISTENCE
+# ======================
 class ServerData:
     def __init__(self, channel_id=None, auto_update=False):
         self.channel_id = channel_id
@@ -67,11 +71,14 @@ class ServerData:
 
 def save_data():
     """Save server data to JSON file"""
-    with open('server_data.json', 'w') as f:
-        json.dump(
-            {guild_id: vars(data) for guild_id, data in server_data.items()},
-            f
-        )
+    try:
+        with open('server_data.json', 'w') as f:
+            json.dump(
+                {guild_id: vars(data) for guild_id, data in server_data.items()},
+                f
+            )
+    except Exception as e:
+        logger.error(f"Error saving data: {str(e)}")
 
 def load_data():
     """Load server data from JSON file"""
@@ -79,107 +86,114 @@ def load_data():
         with open('server_data.json', 'r') as f:
             data = json.load(f)
             return {int(guild_id): ServerData(**values) for guild_id, values in data.items()}
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.warning(f"Loading fresh data: {str(e)}")
         return {}
 
 server_data = load_data()
 
-# Market data functions
-def fetch_market_sentiment():
-    """Fetch market sentiment from Forex Factory"""
+# ======================
+# MARKET DATA FUNCTIONS
+# ======================
+async def fetch_with_retry(ticker_symbol, retries=3, delay=1):
+    """Fetch stock data with retry logic"""
+    for attempt in range(retries):
+        try:
+            if ticker_symbol in data_cache:
+                logger.debug(f"Using cached data for {ticker_symbol}")
+                return data_cache[ticker_symbol]
+                
+            logger.info(f"Fetching fresh data for {ticker_symbol} (attempt {attempt + 1})")
+            data = yf.Ticker(ticker_symbol)
+            hist = data.history(period='2d', interval='15m')
+            
+            if hist.empty:
+                raise ValueError("Empty data returned")
+                
+            data_cache[ticker_symbol] = hist
+            return hist
+            
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            await asyncio.sleep(delay * (attempt + 1))
+            continue
+
+async def fetch_market_sentiment():
+    """Fetch market sentiment from Forex Factory with error handling"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get("https://www.forexfactory.com/", headers=headers, timeout=10)
+        async with requests.Session() as session:
+            response = await session.get(
+                "https://www.forexfactory.com/",
+                headers=headers,
+                timeout=10
+            )
+            response.raise_for_status()
+            
         soup = BeautifulSoup(response.text, 'html.parser')
-        
         events = []
+        
         for row in soup.find_all('tr', class_='calendar__row'):
             if 'calendar__row--header' in row.get('class', []):
                 continue
                 
-            event = {
-                'time': row.find('td', class_='calendar__time').get_text(strip=True),
-                'impact': row.find('td', class_='calendar__impact').find('span')['title'].lower() 
-                         if row.find('td', class_='calendar__impact').find('span') else 'low'
-            }
-            if event['impact'] in ['high', 'medium']:
-                events.append(event)
-                
+            impact = row.find('td', class_='calendar__impact')
+            if impact and impact.find('span'):
+                event_impact = impact.find('span')['title'].lower()
+                if event_impact in ['high', 'medium']:
+                    events.append({
+                        'time': row.find('td', class_='calendar__time').get_text(strip=True),
+                        'impact': event_impact
+                    })
+                    
         return {
-            'impact_events': len([e for e in events if e['impact'] == 'high'])
+            'high_impact_events': len([e for e in events if e['impact'] == 'high']),
+            'total_events': len(events)
         }
         
     except Exception as e:
-        logger.error(f"Error fetching sentiment: {str(e)}")
+        logger.error(f"Sentiment fetch error: {str(e)}")
         return None
 
-def create_chart(symbol_name, history, sentiment_data=None):
-    """Generate market chart with technical indicators"""
+def create_chart(symbol_name, history):
+    """Generate professional trading chart with error handling"""
     try:
         plt.style.use('dark_background')
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1, 1]})
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [3, 1]})
         
-        # Price chart
+        # Main price chart
         prices = history['Close']
-        sma20 = prices.rolling(20).mean()
-        sma50 = prices.rolling(50).mean()
-        
         ax1.plot(history.index, prices, label='Price', color='white', linewidth=2)
-        ax1.plot(history.index, sma20, label='20-SMA', color='#FF9800', linestyle='--')
-        ax1.plot(history.index, sma50, label='50-SMA', color='#9C27B0', linestyle='--')
         
-        # RSI
-        delta = prices.diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        rsi = 100 - (100 / (1 + (gain.rolling(14).mean() / loss.rolling(14).mean())))
+        # Add moving averages
+        for period, color in [(20, '#FF9800'), (50, '#9C27B0')]:
+            sma = prices.rolling(period).mean()
+            ax1.plot(history.index, sma, label=f'{period}-SMA', color=color, linestyle='--')
         
-        ax3.plot(history.index, rsi, color='#00BCD4')
-        ax3.axhline(70, color=COLORS['down'], linestyle='--')
-        ax3.axhline(30, color=COLORS['up'], linestyle='--')
+        # Volume chart
+        ax2.bar(history.index, history['Volume'], color=COLORS['volume'], alpha=0.7)
         
+        # Formatting
+        ax1.legend()
+        ax1.set_title(f'{symbol_name} Price Analysis')
+        ax2.set_title('Trading Volume')
         plt.tight_layout()
+        
+        # Save to buffer
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
+        plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
         buf.seek(0)
         plt.close()
         return buf
         
     except Exception as e:
-        logger.error(f"Chart error: {str(e)}")
+        logger.error(f"Chart generation failed: {str(e)}")
         raise
 
-async def send_market_update(channel, symbol_name, symbol):
-    """Send market update to specified channel"""
-    try:
-        data = yf.Ticker(symbol)
-        hist = data.history(period='2d', interval='15m')
-        
-        if hist.empty:
-            await channel.send(f"❌ No data for {symbol_name}")
-            return False
-            
-        chart = create_chart(symbol_name, hist)
-        await channel.send(
-            file=discord.File(chart, f"{symbol_name}_chart.png"),
-            embed=discord.Embed(
-                title=f"{symbol_name} Market Update",
-                description=f"Last update: {datetime.datetime.now().strftime('%H:%M:%S')}",
-                color=0x00ff00 if hist['Close'][-1] > hist['Close'][-2] else 0xff0000
-            ).add_field(
-                name="Price",
-                value=f"${hist['Close'][-1]:.2f}",
-                inline=True
-            )
-        )
-        return True
-        
-    except Exception as e:
-        logger.error(f"Market update failed: {str(e)}")
-        await channel.send(f"❌ Error updating {symbol_name}")
-        return False
-
-# Bot commands
+# ======================
+# BOT COMMANDS
+# ======================
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setupchannel(ctx, channel: discord.TextChannel = None):
@@ -193,70 +207,131 @@ async def setupchannel(ctx, channel: discord.TextChannel = None):
 @commands.has_permissions(administrator=True)
 async def toggleauto(ctx):
     """Toggle automatic updates"""
-    server = server_data[ctx.guild.id]
-    server.auto_update = not server.auto_update
+    if ctx.guild.id not in server_data:
+        server_data[ctx.guild.id] = ServerData()
+        
+    server_data[ctx.guild.id].auto_update = not server_data[ctx.guild.id].auto_update
     save_data()
-    await ctx.send(f"✅ Automatic updates {'ENABLED' if server.auto_update else 'DISABLED'}")
+    await ctx.send(f"✅ Automatic updates {'ENABLED' if server_data[ctx.guild.id].auto_update else 'DISABLED'}")
 
 @bot.command()
 async def market(ctx, symbol_name: str = None):
-    """Manual market update"""
-    if symbol_name:
-        symbol = symbols.get(symbol_name.title())
-        if symbol:
+    """Get current market data"""
+    try:
+        if symbol_name:
+            symbol = symbols.get(symbol_name.title())
+            if not symbol:
+                return await ctx.send(f"❌ Invalid symbol. Options: {', '.join(symbols.keys())}")
             await send_market_update(ctx.channel, symbol_name, symbol)
         else:
-            await ctx.send(f"❌ Invalid symbol. Options: {', '.join(symbols.keys())}")
-    else:
-        for name, symbol in symbols.items():
-            await send_market_update(ctx.channel, name, symbol)
+            for name, symbol in symbols.items():
+                await send_market_update(ctx.channel, name, symbol)
+                await asyncio.sleep(1)  # Rate limiting
+    except Exception as e:
+        logger.error(f"Market command error: {str(e)}")
+        await ctx.send("❌ Failed to fetch market data")
 
-# Automatic updates
+# ======================
+# CORE FUNCTIONALITY
+# ======================
+async def send_market_update(channel, symbol_name, symbol):
+    """Send comprehensive market update"""
+    try:
+        hist = await fetch_with_retry(symbol)
+        if hist is None:
+            return False
+            
+        # PROPER pandas indexing using .iloc
+        current_price = hist['Close'].iloc[-1]
+        prev_price = hist['Close'].iloc[-2]
+        price_change = ((current_price - prev_price) / prev_price) * 100
+        
+        chart = create_chart(symbol_name, hist)
+        sentiment = await fetch_market_sentiment()
+        
+        embed = discord.Embed(
+            title=f"{symbol_name} Market Update",
+            description=f"Last update: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            color=COLORS['up'] if current_price > prev_price else COLORS['down']
+        )
+        
+        embed.add_field(name="Current Price", value=f"${current_price:.2f}", inline=True)
+        embed.add_field(name="24h Change", value=f"{price_change:.2f}%", inline=True)
+        
+        if sentiment:
+            embed.add_field(
+                name="Market Sentiment",
+                value=f"{sentiment['high_impact_events']} high impact events today",
+                inline=False
+            )
+        
+        file = discord.File(chart, filename=f"{symbol_name}_chart.png")
+        embed.set_image(url=f"attachment://{symbol_name}_chart.png")
+        
+        await channel.send(file=file, embed=embed)
+        return True
+        
+    except Exception as e:
+        logger.error(f"Update failed for {symbol_name}: {str(e)}")
+        await channel.send(f"❌ Failed to update {symbol_name}")
+        return False
+
+# ======================
+# TASKS AND EVENTS
+# ======================
 @tasks.loop(minutes=15)
 async def auto_update():
-    """Automatic market updates every 15 minutes"""
-    logger.info("Running auto-update")
+    """Automatic market updates"""
+    logger.info("Executing auto-update")
     for guild_id, data in server_data.items():
         if data.auto_update and data.channel_id:
             channel = bot.get_channel(data.channel_id)
             if channel:
-                for name, symbol in symbols.items():
-                    await send_market_update(channel, name, symbol)
+                try:
+                    for name, symbol in symbols.items():
+                        await send_market_update(channel, name, symbol)
+                        await asyncio.sleep(2)  # Rate limiting
+                except Exception as e:
+                    logger.error(f"Auto-update error for guild {guild_id}: {str(e)}")
 
-# Bot events
 @bot.event
 async def on_ready():
-    """Initialize when bot starts"""
-    logger.info(f"Logged in as {bot.user.name}")
+    """Initialize bot"""
+    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     
     # Initialize missing guilds
     for guild in bot.guilds:
         if guild.id not in server_data:
             server_data[guild.id] = ServerData()
+            logger.info(f"Initialized new guild: {guild.name}")
     
-    # Start auto-update task
+    save_data()
+    
     if not auto_update.is_running():
         auto_update.start()
-        logger.info("Auto-update task started")
+        logger.info("Started auto-update task")
 
 @bot.event
 async def on_guild_join(guild):
-    """Initialize data for new servers"""
+    """Handle new guilds"""
     server_data[guild.id] = ServerData()
     save_data()
+    logger.info(f"Joined new guild: {guild.name}")
 
-# Error handling
 @bot.event
 async def on_command_error(ctx, error):
+    """Error handling"""
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You need administrator permissions for this command")
     else:
-        logger.error(f"Command error: {str(error)}")
-        await ctx.send("❌ An error occurred")
+        logger.error(f"Command error: {str(error)}", exc_info=True)
+        await ctx.send("❌ An error occurred executing that command")
 
-# Run the bot
+# ======================
+# START BOT
+# ======================
 if __name__ == "__main__":
     try:
         bot.run(DISCORD_TOKEN)
     except Exception as e:
-        logger.critical(f"Bot crashed: {str(e)}")
+        logger.critical(f"Bot crashed: {str(e)}", exc_info=True)
