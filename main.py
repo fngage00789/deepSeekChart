@@ -1,263 +1,164 @@
 import discord
-from discord.ext import commands, tasks
-import yfinance as yf
-import datetime
-import matplotlib.pyplot as plt
-import io
-import os
-import asyncio
-from matplotlib.ticker import MaxNLocator
-from dotenv import load_dotenv
-import pandas as pd
-import numpy as np
-from textblob import TextBlob
-import requests
+from discord.ext import commands
+import aiohttp
 from bs4 import BeautifulSoup
-import json
-import logging
-import traceback
+import datetime
+from typing import List, Dict
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bot.log')
-    ]
-)
-logger = logging.getLogger('discord')
-
-# Load environment variables
-load_dotenv()
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-
-if not DISCORD_TOKEN:
-    logger.critical("No DISCORD_TOKEN found in .env file")
-    raise ValueError("Missing Discord token")
-
-# Bot setup
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
-bot = commands.Bot(
-    command_prefix='!',
-    intents=intents,
-    help_command=None
-)
-
-# Symbols to track
-symbols = {'NAS100': '^NDX', 'Gold': 'GC=F'}
-
-# Chart colors
-COLORS = {
-    'up': '#4CAF50',
-    'down': '#F44336',
-    'volume': '#2196F3',
-    'neutral': '#FFC107',
-    'impact_high': '#FF5722'
-}
-
-# Server data persistence
-class ServerData:
-    def __init__(self, channel_id=None, auto_update=False):
-        self.channel_id = channel_id
-        self.auto_update = auto_update
-
-def save_data():
-    """Save server data to JSON file"""
-    with open('server_data.json', 'w') as f:
-        json.dump(
-            {guild_id: vars(data) for guild_id, data in server_data.items()},
-            f
-        )
-
-def load_data():
-    """Load server data from JSON file"""
-    try:
-        with open('server_data.json', 'r') as f:
-            data = json.load(f)
-            return {int(guild_id): ServerData(**values) for guild_id, values in data.items()}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-server_data = load_data()
-
-# Market data functions
-def fetch_market_sentiment():
-    """Fetch market sentiment from Forex Factory"""
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get("https://www.forexfactory.com/", headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
+class ForexFactoryCommands(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.session = aiohttp.ClientSession()
+        self.base_url = "https://www.forexfactory.com/calendar"
+    
+    async def fetch_calendar_data(self) -> BeautifulSoup:
+        """Fetch and parse the Forex Factory calendar page"""
+        try:
+            async with self.session.get(self.base_url) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    return BeautifulSoup(html, 'html.parser')
+                return None
+        except Exception as e:
+            print(f"Error fetching ForexFactory data: {e}")
+            return None
+    
+    def filter_events(self, soup: BeautifulSoup, asset_filter: str) -> List[Dict]:
+        """Filter events based on asset type (gold, nas100, forex)"""
         events = []
-        for row in soup.find_all('tr', class_='calendar__row'):
-            if 'calendar__row--header' in row.get('class', []):
-                continue
-                
-            event = {
-                'time': row.find('td', class_='calendar__time').get_text(strip=True),
-                'impact': row.find('td', class_='calendar__impact').find('span')['title'].lower() 
-                         if row.find('td', class_='calendar__impact').find('span') else 'low'
-            }
-            if event['impact'] in ['high', 'medium']:
-                events.append(event)
-                
-        return {
-            'impact_events': len([e for e in events if e['impact'] == 'high'])
+        calendar_table = soup.find(id="calendarTable")
+        
+        if not calendar_table:
+            return events
+            
+        for row in calendar_table.find_all("tr", class_="calendar__row"):
+            if not row.get('data-eventid'):
+                continue  # Skip header rows
+            
+            # Extract basic event info
+            time = row.find("td", class_="time").get_text(strip=True)
+            currency = row.find("td", class_="currency").get_text(strip=True)
+            title = row.find("td", class_="event").get_text(strip=True)
+            
+            # Get impact level (high/medium/low)
+            impact_cell = row.find("td", class_="impact")
+            impact = impact_cell.find("span")["class"][0].replace("icon--", "") if impact_cell else "low"
+            
+            # Get actual/forecast/previous values
+            actual = row.find("td", class_="actual").get_text(strip=True)
+            forecast = row.find("td", class_="forecast").get_text(strip=True)
+            previous = row.find("td", class_="previous").get_text(strip=True)
+            
+            # Apply filters based on asset type
+            if asset_filter == "gold":
+                if "XAU" not in currency:
+                    continue
+            elif asset_filter == "nas100":
+                if not any(x in title.upper() for x in ["NASDAQ", "NQ", "TECH", "STOCKS", "EQUITIES"]):
+                    continue
+            elif asset_filter == "forex":
+                if currency not in ["USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"]:
+                    continue
+            
+            events.append({
+                "time": time,
+                "currency": currency,
+                "title": title,
+                "impact": impact,
+                "actual": actual,
+                "forecast": forecast,
+                "previous": previous
+            })
+        
+        return events
+    
+    @commands.command(name='gold')
+    async def gold_news(self, ctx):
+        """Get current gold (XAU) market news from ForexFactory"""
+        await ctx.trigger_typing()
+        
+        soup = await self.fetch_calendar_data()
+        if not soup:
+            return await ctx.send("❌ Failed to fetch data from ForexFactory")
+        
+        events = self.filter_events(soup, "gold")
+        
+        if not events:
+            return await ctx.send("ℹ️ No gold-related news found for today")
+        
+        for event in events[:5]:  # Limit to 5 events to avoid spam
+            embed = self.create_embed(event, "🟠 Gold (XAU) Market News")
+            await ctx.send(embed=embed)
+    
+    @commands.command(name='nas100')
+    async def nas100_news(self, ctx):
+        """Get current NAS100 market news from ForexFactory"""
+        await ctx.trigger_typing()
+        
+        soup = await self.fetch_calendar_data()
+        if not soup:
+            return await ctx.send("❌ Failed to fetch data from ForexFactory")
+        
+        events = self.filter_events(soup, "nas100")
+        
+        if not events:
+            return await ctx.send("ℹ️ No NAS100-related news found for today")
+        
+        for event in events[:5]:
+            embed = self.create_embed(event, "🔵 NAS100 Market News")
+            await ctx.send(embed=embed)
+    
+    @commands.command(name='forex')
+    async def forex_news(self, ctx):
+        """Get current Forex market news from ForexFactory"""
+        await ctx.trigger_typing()
+        
+        soup = await self.fetch_calendar_data()
+        if not soup:
+            return await ctx.send("❌ Failed to fetch data from ForexFactory")
+        
+        events = self.filter_events(soup, "forex")
+        
+        if not events:
+            return await ctx.send("ℹ️ No major forex news found for today")
+        
+        for event in events[:5]:
+            embed = self.create_embed(event, "💱 Forex Market News")
+            await ctx.send(embed=embed)
+    
+    def create_embed(self, event: Dict, title: str) -> discord.Embed:
+        """Create a Discord embed from event data"""
+        color_map = {
+            "high": 0xFF0000,    # Red
+            "medium": 0xFFA500,  # Orange
+            "low": 0xFFFF00      # Yellow
         }
         
-    except Exception as e:
-        logger.error(f"Error fetching sentiment: {str(e)}")
-        return None
-
-def create_chart(symbol_name, history, sentiment_data=None):
-    """Generate market chart with technical indicators"""
-    try:
-        plt.style.use('dark_background')
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1, 1]})
-        
-        # Price chart
-        prices = history['Close']
-        sma20 = prices.rolling(20).mean()
-        sma50 = prices.rolling(50).mean()
-        
-        ax1.plot(history.index, prices, label='Price', color='white', linewidth=2)
-        ax1.plot(history.index, sma20, label='20-SMA', color='#FF9800', linestyle='--')
-        ax1.plot(history.index, sma50, label='50-SMA', color='#9C27B0', linestyle='--')
-        
-        # RSI
-        delta = prices.diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        rsi = 100 - (100 / (1 + (gain.rolling(14).mean() / loss.rolling(14).mean())))
-        
-        ax3.plot(history.index, rsi, color='#00BCD4')
-        ax3.axhline(70, color=COLORS['down'], linestyle='--')
-        ax3.axhline(30, color=COLORS['up'], linestyle='--')
-        
-        plt.tight_layout()
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        plt.close()
-        return buf
-        
-    except Exception as e:
-        logger.error(f"Chart error: {str(e)}")
-        raise
-
-async def send_market_update(channel, symbol_name, symbol):
-    """Send market update to specified channel"""
-    try:
-        data = yf.Ticker(symbol)
-        hist = data.history(period='2d', interval='15m')
-        
-        if hist.empty:
-            await channel.send(f"❌ No data for {symbol_name}")
-            return False
-            
-        chart = create_chart(symbol_name, hist)
-        await channel.send(
-            file=discord.File(chart, f"{symbol_name}_chart.png"),
-            embed=discord.Embed(
-                title=f"{symbol_name} Market Update",
-                description=f"Last update: {datetime.datetime.now().strftime('%H:%M:%S')}",
-                color=0x00ff00 if hist['Close'][-1] > hist['Close'][-2] else 0xff0000
-            ).add_field(
-                name="Price",
-                value=f"${hist['Close'][-1]:.2f}",
-                inline=True
-            )
+        embed = discord.Embed(
+            title=f"{title} - {event['currency']}",
+            description=event["title"],
+            color=color_map.get(event["impact"], 0x000000),
+            timestamp=datetime.datetime.now()
         )
-        return True
         
-    except Exception as e:
-        logger.error(f"Market update failed: {str(e)}")
-        await channel.send(f"❌ Error updating {symbol_name}")
-        return False
-
-# Bot commands
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setupchannel(ctx, channel: discord.TextChannel = None):
-    """Set the channel for automatic updates"""
-    channel = channel or ctx.channel
-    server_data[ctx.guild.id] = ServerData(channel.id, False)
-    save_data()
-    await ctx.send(f"✅ Updates will be posted in {channel.mention}")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def toggleauto(ctx):
-    """Toggle automatic updates"""
-    server = server_data[ctx.guild.id]
-    server.auto_update = not server.auto_update
-    save_data()
-    await ctx.send(f"✅ Automatic updates {'ENABLED' if server.auto_update else 'DISABLED'}")
-
-@bot.command()
-async def market(ctx, symbol_name: str = None):
-    """Manual market update"""
-    if symbol_name:
-        symbol = symbols.get(symbol_name.title())
-        if symbol:
-            await send_market_update(ctx.channel, symbol_name, symbol)
+        embed.add_field(name="🕒 Time", value=event["time"], inline=True)
+        embed.add_field(name="⚡ Impact", value=event["impact"].capitalize(), inline=True)
+        
+        if event["actual"]:
+            embed.add_field(name="📊 Actual", value=event["actual"], inline=True)
+            embed.add_field(name="🔮 Forecast", value=event["forecast"], inline=True)
+            embed.add_field(name="📅 Previous", value=event["previous"], inline=True)
         else:
-            await ctx.send(f"❌ Invalid symbol. Options: {', '.join(symbols.keys())}")
-    else:
-        for name, symbol in symbols.items():
-            await send_market_update(ctx.channel, name, symbol)
+            embed.add_field(name="⏳ Scheduled", value=event["time"], inline=False)
+            embed.add_field(name="🔮 Forecast", value=event["forecast"], inline=True)
+            embed.add_field(name="📅 Previous", value=event["previous"], inline=True)
+        
+        embed.set_footer(text="Data from ForexFactory", icon_url="https://www.forexfactory.com/favicon.ico")
+        return embed
 
-# Automatic updates
-@tasks.loop(minutes=15)
-async def auto_update():
-    """Automatic market updates every 15 minutes"""
-    logger.info("Running auto-update")
-    for guild_id, data in server_data.items():
-        if data.auto_update and data.channel_id:
-            channel = bot.get_channel(data.channel_id)
-            if channel:
-                for name, symbol in symbols.items():
-                    await send_market_update(channel, name, symbol)
+    def cog_unload(self):
+        """Clean up when cog is unloaded"""
+        asyncio.create_task(self.session.close())
 
-# Bot events
-@bot.event
-async def on_ready():
-    """Initialize when bot starts"""
-    logger.info(f"Logged in as {bot.user.name}")
-    
-    # Initialize missing guilds
-    for guild in bot.guilds:
-        if guild.id not in server_data:
-            server_data[guild.id] = ServerData()
-    
-    # Start auto-update task
-    if not auto_update.is_running():
-        auto_update.start()
-        logger.info("Auto-update task started")
-
-@bot.event
-async def on_guild_join(guild):
-    """Initialize data for new servers"""
-    server_data[guild.id] = ServerData()
-    save_data()
-
-# Error handling
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ You need administrator permissions for this command")
-    else:
-        logger.error(f"Command error: {str(error)}")
-        await ctx.send("❌ An error occurred")
-
-# Run the bot
-if __name__ == "__main__":
-    try:
-        bot.run(DISCORD_TOKEN)
-    except Exception as e:
-        logger.critical(f"Bot crashed: {str(e)}")
-
+def setup(bot):
+    bot.add_cog(ForexFactoryCommands(bot))
